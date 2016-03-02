@@ -33,7 +33,7 @@ passphrase once and tries  to reuse it for all the devices. If it fails on one
 device, it asks for a password again.
 
 Devices are specified on the kernel command line:
-cryptdevices=device1:dmname1[:options1];device2:dmname2[:options2];...
+cryptdevices=device1:dmname1[:options1]+device2:dmname2[:options2]+...
 
 Options are optional and separated by commata (,). Currently only one option is
 supported:

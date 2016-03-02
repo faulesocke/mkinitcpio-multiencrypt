@@ -21,8 +21,8 @@ changelog=
 source=("multiencrypt_hook"
         "multiencrypt_install"
         "LICENSE")
-sha256sums=('105be328329e6352df601d64982d90d9cea7c8e7e630739bc69f42882c8523c6'
-            '504a694bc4c8c7153b5112356d498d05e652451a233ada2a575ac433c0bdd4de'
+sha256sums=('79a40a90695f687f9a4caa2cb2d62782cc2058aeda77055bd86d34f46389cac7  '
+            'dfe24de27bb872cae7dcf31a60f9dfd3ec2a85071757dcc687496d66739860cc'
             'c03cea027b4b40e4402fabd08557736727ec3d5bc54ad64ab6472de432198cad')
 validpgpkeys=()
 

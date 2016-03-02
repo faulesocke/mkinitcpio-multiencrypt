@@ -9,7 +9,7 @@ run_hook() {
         return 1
     fi
 
-    for devspec in $(echo "${cryptdevices}" | tr ';' '\n'); do
+    for devspec in $(echo "${cryptdevices}" | tr '+' '\n'); do
         [ -z "${devspec}" ] && continue
         
         IFS=: read cryptdev cryptname cryptoptions <<EOF
