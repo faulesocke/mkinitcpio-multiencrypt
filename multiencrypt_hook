@@ -9,6 +9,35 @@ run_hook() {
         return 1
     fi
 
+    # Get keyfile if specified
+    ckeyfile="/crypto_keyfile.bin"
+    if [ -n "$cryptkey" ]; then
+        IFS=: read ckdev ckarg1 ckarg2 <<EOF
+$cryptkey
+EOF
+
+        if [ "$ckdev" = "rootfs" ]; then
+            ckeyfile=$ckarg1
+        elif resolved=$(resolve_device "${ckdev}" ${rootdelay}); then
+            case ${ckarg1} in
+                *[!0-9]*)
+                    # Use a file on the device
+                    # ckarg1 is not numeric: ckarg1=filesystem, ckarg2=path
+                    mkdir /ckey
+                    mount -r -t "$ckarg1" "$resolved" /ckey
+                    dd if="/ckey/$ckarg2" of="$ckeyfile" >/dev/null 2>&1
+                    umount /ckey
+                    ;;
+                *)
+                    # Read raw data from the block device
+                    # ckarg1 is numeric: ckarg1=offset, ckarg2=length
+                    dd if="$resolved" of="$ckeyfile" bs=1 skip="$ckarg1" count="$ckarg2" >/dev/null 2>&1
+                    ;;
+            esac
+        fi
+        [ ! -f ${ckeyfile} ] && echo "Keyfile could not be opened. Reverting to passphrase."
+    fi
+
     for devspec in $(echo "${cryptdevices}" | tr ';' '\n'); do
         [ -z "${devspec}" ] && continue
         
@@ -40,10 +69,14 @@ EOF
             continue
         fi
 
+        # If keyfile exists, try to use that
+        if [ -f ${ckeyfile} ]; then
+            if eval cryptsetup --key-file ${ckeyfile} open --type luks ${resolved} ${cryptname} ${cryptargs} ${CSQUIET}; then
+                echo "Configured ${cryptname} with keyfile."
+            fi
+        fi
+
         while ! [ -e "/dev/mapper/${cryptname}" ]; do
-            #eval cryptsetup open --type luks --test-passphrase ${resolved} ${cryptname} ${cryptargs} >/dev/null 2>/dev/null <<EOF
-#${pw}
-#EOF
             if [ -z "$pw" ]; then
                 echo -n "Enter password for ${cryptname}: "
                 read -r -s pw
@@ -54,6 +87,7 @@ EOF
 ${pw}
 EOF
             if [ $? -eq 0 ]; then
+                echo "Configured ${cryptname}."
                 break
             else
                 pw=""
