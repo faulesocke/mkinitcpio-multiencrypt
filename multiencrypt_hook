@@ -1,69 +1,167 @@
 #!/usr/bin/ash
 
 run_hook() {
-    local pw
     modprobe -a -q dm-crypt >/dev/null 2>&1
     [ "${quiet}" = "y" ] && CSQUIET=">/dev/null"
 
+    multiencrypt_delimiter="${multiencrypt_delimiter:-@}"
     if [ -z "${cryptdevices}" ]; then
         return 1
     fi
 
-    for devspec in $(echo "${cryptdevices}" | tr ';' '\n'); do
+    local idx=1
+    for devspec in ${cryptdevices//${multiencrypt_delimiter}/ }; do
         [ -z "${devspec}" ] && continue
-        
-        IFS=: read cryptdev cryptname cryptoptions <<EOF
+
+        ckeyfile="/crypto_keyfile.bin"
+        _cryptkey="$(echo ${cryptkeys} | awk -F"${multiencrypt_delimiter}" "{print \$${idx}}")"
+        if [ -n "${_cryptkey}" ]; then
+            IFS=: read _ckdev _ckarg1 _ckarg2 <<EOF
+${_cryptkey}
+EOF
+
+            if [ "${_ckdev}" = "rootfs" ]; then
+                ckeyfile="${_ckarg1}"
+            elif resolved=$(resolve_device "${_ckdev}" "${rootdelay}"); then
+                case "${_ckarg1}" in
+                    *[!0-9]*)
+                        # Use a file on the device
+                        # _ckarg1 is not numeric: _ckarg1=filesystem, _ckarg2=path
+                        mkdir -p /ckey
+                        mount -r -t "${_ckarg1}" "${resolved}" /ckey
+                        dd if="/ckey/${_ckarg2}" of="${ckeyfile}" >/dev/null 2>&1
+                        umount /ckey
+                        ;;
+                    *)
+                        # Read raw data from the block device
+                        # ckarg1 is numeric: ckarg1=offset, ckarg2=length
+                        dd if="${resolved}" of="${ckeyfile}" bs=1 skip="${_ckarg1}" count="${_ckarg2}" >/dev/null 2>&1
+                        ;;
+                esac
+            fi
+            [ ! -f "${ckeyfile}" ] && echo "Keyfile could not be opened. Reverting to passphrase."
+        fi
+
+        IFS=: read _cryptdev _cryptname _cryptoptions <<EOF
 ${devspec}
 EOF
 
+        # This may happen if third party hooks do the crypt setup
+        if [ -b "/dev/mapper/${_cryptname}" ]; then
+            echo "Device ${_cryptname} already exists, not doing any crypt setup."
+            continue
+        fi
+
         # parse options
-        cryptargs=""
-        for cryptopt in ${cryptoptions//,/ }; do
-            case ${cryptopt} in
+        for _cryptopt in ${_cryptoptions//,/ }; do
+            case "${_cryptopt}" in
                 allow-discards)
-                    cryptargs="${cryptargs} --allow-discards"
+                    _cryptargs="${_cryptargs} --allow-discards"
                     ;;
                 *)
-                    echo "Encryption option '${cryptopt}' not known, ignoring" >&2
+                    echo "Encryption option '${_cryptopt}' not known, ignoring" >&2
                     ;;
             esac
         done
 
-        # try to decrypt
-        if ! resolved=$(resolve_device "${cryptdev}" ${rootdelay}); then
-            err "Device ${cryptdev} could not be resolved. Skipping..."
-            continue
-        fi
-
-        if ! eval cryptsetup isLuks ${resolved} >/dev/null 2>&1; then
-            err "Failed to open device ${cryptdev}: Not a LUKS volume!"
-            continue
-        fi
-
-        while ! [ -e "/dev/mapper/${cryptname}" ]; do
-            #eval cryptsetup open --type luks --test-passphrase ${resolved} ${cryptname} ${cryptargs} >/dev/null 2>/dev/null <<EOF
-#${pw}
-#EOF
-            if [ -z "$pw" ]; then
-                echo -n "Enter password for ${cryptname}: "
-                read -r -s pw
-                echo ""
-            fi
-
-            eval cryptsetup open --type luks ${resolved} ${cryptname} ${cryptargs} ${CSQUIET} <<EOF
-${pw}
+        cheaderfile="/crypto_header.bin"
+        _cryptheader="$(echo ${cryptheaders} | awk -F"${multiencrypt_delimiter}" "{print \$${idx}}")"
+        if [ -n "${_cryptheader}" ]; then
+            IFS=: read _chdev _charg1 _charg2 <<EOF
+${_cryptheader}
 EOF
-            if [ $? -eq 0 ]; then
-                break
-            else
-                pw=""
-            fi
-        done
 
-        if ! [ -e "/dev/mapper/${cryptname}" ]; then
-            err "Password succeeded, but ${cryptname} creation failed, skipping..."
-            continue
+            if [ "${_chdev}" = "rootfs" ]; then
+                cheaderfile="${_charg1}"
+            elif resolved=$(resolve_device "${_chdev}" "${rootdelay}"); then
+                case "${_charg1}" in
+                    *[!0-9]*)
+                        # Use a file on the device
+                        # _charg1 is not numeric: _charg1=filesystem, _charg2=path
+                        mkdir -p /cheader
+                        mount -r -t "${_charg1}" "${resolved}" /cheader
+                        dd if="/cheader/${_charg2}" of="${cheaderfile}" >/dev/null 2>&1
+                        umount /cheader
+                        ;;
+                    *)
+                        # Read raw data from the block device
+                        # _charg1 is numeric: _charg1=offset, _charg2=length
+                        dd if="${resolved}" of="${cheaderfile}" bs=1 skip="${_charg1}" count="${_charg2}" >/dev/null 2>&1
+                        ;;
+                esac
+            fi
+
+            if [ -f "${cheaderfile}" ]; then
+                _cryptargs="${_cryptargs} --header ${cheaderfile}"
+            else
+                echo "Detached header could not be opened. Reverting to passphrase."
+            fi
         fi
+
+        # try to decrypt
+        if resolved=$(resolve_device "${_cryptdev}" "${rootdelay}"); then
+            _crypto="$(echo ${cryptos} | awk -F"${multiencrypt_delimiter}" "{print \$${idx}}")"
+            if (cryptsetup isLuks "${resolved}" >/dev/null 2>&1 || cryptsetup isLuks "${cheaderfile}" >/dev/null 2>&1); then
+                dopassphrase=1
+
+                # If keyfile exists, try to use that
+                if [ -f "${ckeyfile}" ]; then
+                    if eval cryptsetup --key-file "${ckeyfile}" open --type luks "${resolved}" "${_cryptname}" "${_cryptargs}" "${CSQUIET}"; then
+                        dopassphrase=0
+                    else
+                        echo "Invalid keyfile. Reverting to passphrase."
+                    fi
+                fi
+
+                # Ask for a passphrase
+                if [ "${dopassphrase}" -gt 0 ]; then
+                    echo ""
+                    echo "A password is required to access the ${_cryptname} volume:"
+
+                    #loop until we get a real password
+                    while ! eval cryptsetup open --type luks "${resolved}" "${_cryptname}" "${_cryptargs}" "${CSQUIET}"; do
+                        sleep 2;
+                    done
+                fi
+            elif [ -n "${_crypto}" ]; then
+                msg "Non-LUKS encrypted device found..."
+                if echo "${_crypto}" | awk -F: '{ exit(NF == 5) }'; then
+                    err "Verify parameter format: cryptos=hash:cipher:keysize:offset:skip"
+                    err "Non-LUKS decryption not attempted..."
+                    continue
+                fi
+                exe="cryptsetup open --type plain ${resolved} ${_cryptname} ${_cryptargs}"
+                IFS=: read _c_hash _c_cipher _c_keysize _c_offset _c_skip <<EOF
+${_crypto}
+EOF
+                [ -n "${_c_hash}" ]    && exe="${exe} --hash '${_c_hash}'"
+                [ -n "${_c_cipher}" ]  && exe="${exe} --cipher '${_c_cipher}'"
+                [ -n "${_c_keysize}" ] && exe="${exe} --key-size '${_c_keysize}'"
+                [ -n "${_c_offset}" ]  && exe="${exe} --offset '${_c_offset}'"
+                [ -n "${_c_skip}" ]    && exe="${exe} --skip '${_c_skip}'"
+
+                if [ -f "${ckeyfile}" ]; then
+                    exe="${exe} --key-file ${ckeyfile}"
+                else
+                    echo ""
+                    echo "A password is required to access the ${_cryptname} volume:"
+                fi
+                eval "${exe} ${CSQUIET}"
+
+                if [ "${?}" -ne 0 ]; then
+                    err "Non-LUKS device decryption failed. verify format: "
+                    err "      cryptos=hash:cipher:keysize:offset:skip"
+                    continue
+                fi
+            fi
+            if ! [ -e "/dev/mapper/${_cryptname}" ]; then
+                err "Password succeeded, but ${_cryptname} creation failed, aborting..."
+                continue
+            fi
+        fi
+        idx="$((${idx}+1))"
+
+        rm -f "${ckeyfile}" "${cheaderfile}"
     done
 }
 
